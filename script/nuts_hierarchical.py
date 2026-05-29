@@ -1,0 +1,267 @@
+import argparse
+
+import torch
+import pyro
+import pyro.distributions as dist
+from pyro.infer import MCMC, NUTS
+import astropy.units as u
+import astropy.constants as const
+from astropy.cosmology import Planck18 
+
+from snhost.script.data import load_hierarchical_gp_data
+from snhost.script.kernels import sq_exp
+
+dtype = None
+device = None
+
+def scalar(x):
+    return torch.tensor(x, dtype=dtype, device=device)
+
+def zeros(*shape):
+    return torch.zeros(*shape, dtype=dtype, device=device)
+
+def ones(*shape):
+    return torch.ones(*shape, dtype=dtype, device=device)
+
+def eye(n):
+    return torch.eye(n, dtype=dtype, device=device)
+
+def calculate_sig_mu_th(z, sig_z, sig_pec=200):        
+    """Distance-modulus uncertainty from redshift and peculiar velocity.
+    """
+    c = (const.c).to(u.km / u.s).value
+    return torch.sqrt((5 / (z * torch.log(scalar(10.))))**2 * ((sig_pec / c)**2 + sig_z**2))   
+
+def permute_cov(W, n_sn, d=3):
+    """Reorder block-diagonal per-SN covariances to [all mB, all x1, all c].
+    """
+    idx = torch.arange(n_sn * d, device=W.device).reshape(n_sn, d).T.reshape(-1)
+    return W[idx][:, idx]
+
+def build_C(H, thetas, s, WM, force_sym=True): 
+    """Build final covariance matrix C from hyperparameters H, host parameters theta, mu uncertainties s, and SALT2-permuted covariances WM.
+    Parameters: 
+        H: hyperparameters (21) [most efficiently without dust hyperparameters a & b]; dict
+        thetas: host parameters; (n_sn, 4)
+        s: diagonal matrix of distance modulus error assumed to come only from z and pec_z; (n_sn,)
+        WM: permuted SALT2 covariance matrix; (3*n, 3*n)
+
+    Returns: 
+        C: covariance matrix; (3*n, 3*n)
+    """  
+    # Helpers
+    n_sn = thetas.shape[0]
+    I = eye(n_sn)
+
+    # K  
+    K_gamma = sq_exp(thetas, thetas, params=H["gamma"])   
+    K_psi = sq_exp(thetas, thetas, params=H["psi"])
+    K_phi = sq_exp(thetas, thetas, params=H["phi"])
+
+    # A, B 
+    A = torch.vstack((H["alpha_x"] * I, H["beta_c"] * I)).T
+    B_1 = torch.hstack((K_phi + H["sigma_x"]**2 * I, H["alpha_c"] * (K_phi + H["sigma_x"]**2 * I)),)
+    B_2 = torch.hstack((H["alpha_c"] * (K_phi + H["sigma_x"]**2 * I), H["alpha_c"]**2 * (K_phi + H["sigma_x"]**2 * I) + K_psi + H["sigma_c"]**2 * I),)
+    B = torch.vstack((B_1, B_2))
+
+    # S
+    S11 = A @ B @ A.T + K_gamma + I * H["sigma_0"]**2 + s
+    S12 = A @ B
+    S21 = B @ A.T
+    S22 = B 
+    S = torch.vstack((
+        torch.hstack((S11, S12)),
+        torch.hstack((S21, S22)),
+    ))
+
+    C = S + WM
+    if force_sym:                # to account for tiny floating-point errors
+        C = 0.5 * (C + C.T)
+
+    return C
+
+def model(yhat, thetas, mu_lcdm, s, WM, jitter=1e-8):
+    """Define hierarchical model and likelihood for inference. 
+    Parameters: 
+        yhat: observed SN parameters, flattened; (3*n_sn,)
+        thetas: host parameters; (n_sn, 4)
+        mu_lcdm: cosmologically predicted distance modulus; (n_sn,) 
+        s: diagonal matrix of distance modulus error assumed to come only from z and pec_z; (n_sn,)
+        WM: permuted SALT2 covariance matrix; (3*n, 3*n)
+        jitter: minute numerical value added for stability; default 1e-8
+
+    Returns: 
+        C: covariance matrix; (3*n, 3*n)
+
+    Returns: None
+    """
+    n_sn = thetas.shape[0]
+
+    # (1) Hyperpriors
+        # Cannot truly be drawn from -inf, inf, so use big number approximations  
+    # SN/global hyperparameters
+    alpha_x = pyro.sample("alpha_x", dist.Uniform(-100., 100.))
+    alpha_c = pyro.sample("alpha_c", dist.Uniform(-100., 100.))
+    beta_c  = pyro.sample("beta_c",  dist.Uniform(-100., 100.))
+
+    sigma_0 = pyro.sample("sigma_0", dist.Uniform(0., 100.))
+    sigma_x = pyro.sample("sigma_x", dist.Uniform(0., 100.))
+    sigma_c = pyro.sample("sigma_c", dist.Uniform(0., 100.))
+
+    M_0 = pyro.sample("M_0", dist.Uniform(-100., 100.))
+    R_B = pyro.sample("R_B", dist.Uniform(0., 100.))
+
+    # GP kernel hyperparameters: for D=4 host inputs, each has 1 sigma_f + 4 ell
+    gamma_sf  = pyro.sample("gamma_sf",  dist.Uniform(0., 100.))
+    gamma_ell = pyro.sample("gamma_ell", dist.Uniform(zeros(4), ones(4) * 100.))
+
+    psi_sf  = pyro.sample("psi_sf",  dist.Uniform(0., 100.))
+    psi_ell = pyro.sample("psi_ell", dist.Uniform(zeros(4), ones(4) * 100.))
+
+    phi_sf  = pyro.sample("phi_sf",  dist.Uniform(0., 100.))
+    phi_ell = pyro.sample("phi_ell", dist.Uniform(zeros(4), ones(4) * 100.))
+
+    # Dust population hyperparameters
+    a = pyro.sample("a", dist.Uniform(-100., 100.))
+    b = pyro.sample("b", dist.Uniform(-100., 100.))
+
+    tau_2 = thetas[:, -1]
+    tau_e = torch.nn.functional.softplus(a * tau_2 + b) + jitter   # guarantee positivity + jitter
+    # tau_e = a * tau_2 + b                    
+
+    # (2) Latent dust for every SN
+    with pyro.plate("sn", n_sn):
+        E_BV = pyro.sample("E_BV", dist.Exponential(rate=1.0 / tau_e))   
+
+    # (3) Assemble likelihood
+    # Build mean vector nu
+    nu = torch.cat([
+        M_0 * ones(n_sn) + mu_lcdm + R_B * E_BV,
+        zeros(n_sn),
+        E_BV,
+    ])                                      # (1899,)
+
+    # Build covariance C
+    H_nodust = {
+        "alpha_x": alpha_x,
+        "alpha_c": alpha_c,
+        "beta_c": beta_c,
+        "sigma_0": sigma_0,
+        "sigma_x": sigma_x,
+        "sigma_c": sigma_c,
+        "gamma": {"sigma_f": gamma_sf, "ell": gamma_ell},
+        "psi": {"sigma_f": psi_sf, "ell": psi_ell},
+        "phi": {"sigma_f": phi_sf, "ell": phi_ell},
+    }
+
+    C = build_C(H_nodust, thetas, s, WM)
+
+    L = torch.linalg.cholesky(C + jitter * eye(C.shape[0]), upper=False)    # add jitter if needed 
+
+    pyro.sample(
+        "yhat",
+        dist.MultivariateNormal(loc=nu, scale_tril=L),   # can pass one of: covariance_matrix, precision_matrix, or scale_tril [most efficient; lower-triangular factor of covariance w/ positive-valued diagonal]
+        obs=yhat,   
+    )
+
+def main(args): 
+    global dtype, device
+
+    dtype = getattr(torch, args.dtype)
+    device = torch.device("cuda" if args.cuda else args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested, but torch.cuda.is_available() is False.")
+
+    torch.set_default_dtype(dtype)
+    pyro.set_rng_seed(args.rng_seed)
+
+    # LOAD DATA
+    data = load_hierarchical_gp_data(
+        ztf_dir=args.ztf_dir,
+        gal_dir=args.gal_dir,
+        dtype=dtype,
+        device=device,
+    )
+
+    thetas = data["thetas"]
+    yhat = data["yhat"].reshape(-1)         # (3*n_sn,)
+    n_sn = thetas.shape[0]
+   
+    s = torch.diag(calculate_sig_mu_th(data["z_cmb_cat"], data["zcmb_cat_err"])**2)
+    W = zeros(n_sn*3, n_sn*3)
+    for i in range(n_sn): 
+        l = 3*i
+        h = 3*(i+1)
+        cov_i = torch.stack([
+            torch.stack([(data["sig_mB"]**2)[i], data["sig_mBx1"][i], data["sig_mBc"][i]]),
+            torch.stack([data["sig_mBx1"][i], (data["sig_x1"]**2)[i], data["sig_x1c"][i]]),
+            torch.stack([data["sig_mBc"][i], data["sig_x1c"][i], (data["sig_c"]**2)[i]]),
+        ])
+        W[l:h, l:h] = cov_i
+    WM = permute_cov(W, n_sn=n_sn, d=3)
+
+    cosmo = Planck18
+    mu_lcdm = torch.as_tensor(
+        cosmo.distmod(data["z_cmb_cat"].detach().cpu().numpy()).value,
+        dtype=dtype,
+        device=device,
+    )
+
+    print(f"Using device: {device}")
+    print(f"Using dtype: {dtype}")
+    print(f"n_sn: {n_sn}")
+
+    # RUN INFERENCE
+    nuts_kernel = NUTS(
+        model,    
+        target_accept_prob=args.target_accept_prob,     # default 0.8 
+        max_tree_depth=args.max_tree_depth,             # default 10 
+    )
+
+    mcmc = MCMC(
+        nuts_kernel,
+        num_samples=args.num_samples,              # 2000 -> will take a long time
+        warmup_steps=args.warmup_steps,
+        num_chains=args.num_chains,                # default: chains will run in parallel w/ jax.pmap()
+    )
+
+    mcmc.run(yhat, thetas, mu_lcdm, s, WM, jitter=args.jitter)
+
+    # SAVE SAMPLES 
+    torch.save(
+        {
+            "samples": mcmc.get_samples(group_by_chain=True),
+            "summary": mcmc.summary(), 
+            "diagnostics": mcmc.diagnostics(),
+        },
+        args.output,                                # f"nuts_{args.num_samples}.pt",       
+    )
+
+if __name__ == '__main__': 
+    parser = argparse.ArgumentParser(description="Hierarchical Bayesian SN Ia with NUTS")
+
+    parser.add_argument("-n", "--num-samples", nargs="?", default=1000, type=int)
+    parser.add_argument("--num-chains", nargs="?", default=1, type=int)
+    parser.add_argument("--warmup-steps", nargs="?", default=1000, type=int)
+    parser.add_argument("--rng_seed", nargs="?", default=0, type=int)
+    parser.add_argument("--target_accept_prob", nargs="?", default=0.85, type=float)
+    parser.add_argument("--max_tree_depth", nargs="?", default=10, type=int)
+    
+    # parser.add_argument("--ztf-dir", default="/home/jjg65/rds/hpc-work/ztf_sn/")
+    # parser.add_argument("--gal-dir", default="/home/jjg65/rds/hpc-work/ztf_meds/")
+    parser.add_argument("--ztf-dir", default="/Users/joygong/CAMBRIDGE/inputs/ztf/")
+    parser.add_argument("--gal-dir", default="/Users/joygong/CAMBRIDGE/outputs/gal_params/")
+    parser.add_argument("--dtype", choices=["float32", "float64"], default="float64")
+    parser.add_argument("--device", default="cpu")                  
+    parser.add_argument("--jitter", default=1e-8, type=float)
+    # parser.add_argument("--output", default="/home/jjg65/rds/hpc-work/ztf_nuts/nuts_samples.pt")
+    parser.add_argument("--output", default="/Users/joygong/CAMBRIDGE/snhost/scratch/nuts_test2.pt")
+    parser.add_argument("--cuda", action="store_true", help="run on GPU")
+
+    args = parser.parse_args()
+
+    main(args) 
+
+
+    
+
