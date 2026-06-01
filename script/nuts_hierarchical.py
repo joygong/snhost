@@ -38,6 +38,19 @@ def permute_cov(W, n_sn, d=3):
     idx = torch.arange(n_sn * d, device=W.device).reshape(n_sn, d).T.reshape(-1)
     return W[idx][:, idx]
 
+def build_K(H, thetas):
+    """Build prior covariance matrices K_gamma, K_psi, K_phi given GP hyperparameters. 
+    """
+    K_gamma = sq_exp(thetas, thetas, params=H["gamma"])   
+    K_psi = sq_exp(thetas, thetas, params=H["psi"])
+    K_phi = sq_exp(thetas, thetas, params=H["phi"])
+
+    K = {"K_gamma": K_gamma, 
+         "K_psi": K_psi,
+         "K_phi": K_phi}
+
+    return K
+
 def build_C(H, thetas, s, WM, force_sym=True): 
     """Build final covariance matrix C from hyperparameters H, host parameters theta, mu uncertainties s, and SALT2-permuted covariances WM.
     Parameters: 
@@ -54,9 +67,8 @@ def build_C(H, thetas, s, WM, force_sym=True):
     I = eye(n_sn)
 
     # K  
-    K_gamma = sq_exp(thetas, thetas, params=H["gamma"])   
-    K_psi = sq_exp(thetas, thetas, params=H["psi"])
-    K_phi = sq_exp(thetas, thetas, params=H["phi"])
+    K = build_K(H, thetas)
+    K_gamma, K_psi, K_phi = K["K_gamma"], K["K_psi"], K["K_phi"]
 
     # A, B 
     A = torch.vstack((H["alpha_x"] * I, H["beta_c"] * I)).T
@@ -80,22 +92,23 @@ def build_C(H, thetas, s, WM, force_sym=True):
 
     return C
 
-def model(yhat, thetas, mu_lcdm, s, WM, jitter=1e-8):
+def model(yhat, thetas, mu_lcdm, sig_mu, WM, jitter=1e-8, tau_const=True, model_type="marginalized"):
     """Define hierarchical model and likelihood for inference. 
     Parameters: 
         yhat: observed SN parameters, flattened; (3*n_sn,)
         thetas: host parameters; (n_sn, 4)
         mu_lcdm: cosmologically predicted distance modulus; (n_sn,) 
-        s: diagonal matrix of distance modulus error assumed to come only from z and pec_z; (n_sn,)
+        sig_mu: distance modulus uncertainty assumed to come only from z and pec_z; (n_sn,). [NOTE: non-diagonalized, not a matrix!]
         WM: permuted SALT2 covariance matrix; (3*n, 3*n)
         jitter: minute numerical value added for stability; default 1e-8
-
-    Returns: 
-        C: covariance matrix; (3*n, 3*n)
+        model_type: 'marginalized' or 'explicit'
+            - 'marginalized': likelihood = p(yhat | E_BV, H) with covariance S + WM
+            - 'explicit': likelihood = p(yhat | latent true y) p(latent true y | H, E_BV) with covariance WM 
 
     Returns: None
     """
     n_sn = thetas.shape[0]
+    I = eye(n_sn)
 
     # (1) Hyperpriors
         # Cannot truly be drawn from -inf, inf, so use big number approximations  
@@ -113,35 +126,15 @@ def model(yhat, thetas, mu_lcdm, s, WM, jitter=1e-8):
 
     # GP kernel hyperparameters: for D=4 host inputs, each has 1 sigma_f + 4 ell
     gamma_sf  = pyro.sample("gamma_sf",  dist.Uniform(0., 100.))
-    gamma_ell = pyro.sample("gamma_ell", dist.Uniform(zeros(4), ones(4) * 100.))
+    gamma_ell = pyro.sample("gamma_ell", dist.Uniform(zeros(4), ones(4) * 100.).to_event(1))
 
     psi_sf  = pyro.sample("psi_sf",  dist.Uniform(0., 100.))
-    psi_ell = pyro.sample("psi_ell", dist.Uniform(zeros(4), ones(4) * 100.))
+    psi_ell = pyro.sample("psi_ell", dist.Uniform(zeros(4), ones(4) * 100.).to_event(1))
 
     phi_sf  = pyro.sample("phi_sf",  dist.Uniform(0., 100.))
-    phi_ell = pyro.sample("phi_ell", dist.Uniform(zeros(4), ones(4) * 100.))
+    phi_ell = pyro.sample("phi_ell", dist.Uniform(zeros(4), ones(4) * 100.).to_event(1))
 
-    # Dust population hyperparameters
-    a = pyro.sample("a", dist.Uniform(-100., 100.))
-    b = pyro.sample("b", dist.Uniform(-100., 100.))
-
-    tau_2 = thetas[:, -1]
-    tau_e = torch.nn.functional.softplus(a * tau_2 + b) + jitter   # guarantee positivity + jitter
-    # tau_e = a * tau_2 + b                    
-
-    # (2) Latent dust for every SN
-    with pyro.plate("sn", n_sn):
-        E_BV = pyro.sample("E_BV", dist.Exponential(rate=1.0 / tau_e))   
-
-    # (3) Assemble likelihood
-    # Build mean vector nu
-    nu = torch.cat([
-        M_0 * ones(n_sn) + mu_lcdm + R_B * E_BV,
-        zeros(n_sn),
-        E_BV,
-    ])                                      # (1899,)
-
-    # Build covariance C
+    # Build hyperparameters H_nodust to feed into covariance C
     H_nodust = {
         "alpha_x": alpha_x,
         "alpha_c": alpha_c,
@@ -154,15 +147,79 @@ def model(yhat, thetas, mu_lcdm, s, WM, jitter=1e-8):
         "phi": {"sigma_f": phi_sf, "ell": phi_ell},
     }
 
-    C = build_C(H_nodust, thetas, s, WM)
+    # Dust population hyperparameters
+    if tau_const:
+        tau = pyro.sample("tau", dist.Uniform(0., 100.))
+        tau_e = tau.expand(n_sn)
+    else:
+        a = pyro.sample("a", dist.Uniform(-100., 100.))
+        b = pyro.sample("b", dist.Uniform(-100., 100.))
+        tau_2 = thetas[:, -1]
+        tau_e = torch.nn.functional.softplus(a * tau_2 + b)         # + jitter
 
-    L = torch.linalg.cholesky(C + jitter * eye(C.shape[0]), upper=False)    # add jitter if needed 
+    pyro.deterministic("tau_e", tau_e)              # save one value per SN 
 
-    pyro.sample(
-        "yhat",
-        dist.MultivariateNormal(loc=nu, scale_tril=L),   # can pass one of: covariance_matrix, precision_matrix, or scale_tril [most efficient; lower-triangular factor of covariance w/ positive-valued diagonal]
-        obs=yhat,   
-    )
+    # (2) Latent dust for every SN
+    sn_plate = pyro.plate("sn", n_sn)
+    with sn_plate:
+        E_BV = pyro.sample("E_BV", dist.Exponential(rate=1.0 / tau_e))
+
+    # (3) Analytically marginalized version: likelihood = p(yhat | H, E_BV) 
+    if model_type == "marginalized":
+        s = torch.diag(sig_mu**2)
+
+        nu = torch.cat([
+            M_0 * ones(n_sn) + mu_lcdm + R_B * E_BV,
+            zeros(n_sn),
+            E_BV,
+        ])                                      # (1899,)
+
+        C = build_C(H_nodust, thetas, s, WM)
+        L = torch.linalg.cholesky(C + jitter * eye(C.shape[0]), upper=False)    # add jitter if needed 
+
+        pyro.sample(
+            "yhat",
+            dist.MultivariateNormal(loc=nu, scale_tril=L),      # can pass one of: covariance_matrix, precision_matrix, or scale_tril [most efficient; lower-triangular factor of covariance w/ positive-valued diagonal]
+            obs=yhat,   
+        )
+    
+    # (3) Explicit latent prediction version: likelihood = p(yhat | latent true y) p(latent true y | H, E_BV)
+    elif model_type == "explicit":
+        K = build_K(H_nodust, thetas)
+        K_gamma, K_psi, K_phi = K["K_gamma"], K["K_psi"], K["K_phi"]
+
+        x1 = pyro.sample("x1", dist.MultivariateNormal(zeros(n_sn), K_phi + sigma_x**2 * I))
+        c_int_resid = pyro.sample("c_int_resid", dist.MultivariateNormal(zeros(n_sn), K_psi + sigma_c**2 * I))
+        M_int_resid = pyro.sample("M_int_resid", dist.MultivariateNormal(zeros(n_sn), K_gamma + sigma_0**2 * I))
+    
+        # Latent mu for every SN 
+        with sn_plate: 
+            mu = pyro.sample("mu", dist.Normal(mu_lcdm, sig_mu))   # note std is fed in, NOT variance 
+
+        c_int = alpha_c * x1 + c_int_resid
+        M_int = (M_0 + alpha_x * x1 + beta_c * c_int + M_int_resid)
+
+        mB_true = M_int + R_B * E_BV + mu 
+        x1_true = x1
+        c_true = c_int + E_BV
+
+        # Apparent (dust-extincted) latents
+        pyro.deterministic("mB_true", mB_true)
+        pyro.deterministic("x1_true", x1_true)
+        pyro.deterministic("c_true", c_true)
+
+        y_true = torch.cat([mB_true, x1_true, c_true])
+        WM = 0.5 * (WM + WM.T)
+        L_WM = torch.linalg.cholesky(WM + jitter * eye(WM.shape[0]), upper=False)   
+
+        pyro.sample(
+            "yhat",
+            dist.MultivariateNormal(loc=y_true, scale_tril=L_WM),    # WM only; sig_mu is represented by the sampled latent mu
+            obs=yhat,
+        )
+
+    else: 
+        raise ValueError(f"Unknown model_type: {model_type}")
 
 def main(args): 
     global dtype, device
@@ -183,11 +240,14 @@ def main(args):
         device=device,
     )
 
+    # check to see if loaded in corrected covariances
+    print('sig_mB:', data["sig_mB"])
+
     thetas = data["thetas"]
     yhat = data["yhat"].reshape(-1)         # (3*n_sn,)
     n_sn = thetas.shape[0]
    
-    s = torch.diag(calculate_sig_mu_th(data["z_cmb_cat"], data["zcmb_cat_err"])**2)
+    sig_mu = calculate_sig_mu_th(data["z_cmb_cat"], data["zcmb_cat_err"])
     W = zeros(n_sn*3, n_sn*3)
     for i in range(n_sn): 
         l = 3*i
@@ -210,6 +270,9 @@ def main(args):
     print(f"Using device: {device}")
     print(f"Using dtype: {dtype}")
     print(f"n_sn: {n_sn}")
+    print("jitter =", args.jitter)
+    print("tau_const =", args.tau_const)
+    print("model =", args.model)
 
     # RUN INFERENCE
     nuts_kernel = NUTS(
@@ -225,7 +288,7 @@ def main(args):
         num_chains=args.num_chains,                # default: chains will run in parallel w/ jax.pmap()
     )
 
-    mcmc.run(yhat, thetas, mu_lcdm, s, WM, jitter=args.jitter)
+    mcmc.run(yhat, thetas, mu_lcdm, sig_mu, WM, jitter=args.jitter, tau_const=args.tau_const, model_type=args.model)
 
     # SAVE SAMPLES 
     torch.save(
@@ -254,8 +317,10 @@ if __name__ == '__main__':
     parser.add_argument("--dtype", choices=["float32", "float64"], default="float64")
     parser.add_argument("--device", default="cpu")                  
     parser.add_argument("--jitter", default=1e-8, type=float)
-    # parser.add_argument("--output", default="/home/jjg65/rds/hpc-work/ztf_nuts/nuts_samples.pt")
-    parser.add_argument("--output", default="/Users/joygong/CAMBRIDGE/snhost/scratch/nuts_test2.pt")
+    parser.add_argument("--tau-const", action=argparse.BooleanOptionalAction, default=True, help="use one shared dust-population tau")
+    parser.add_argument("--model", choices=["marginalized", "explicit"], default="marginalized")
+    # parser.add_argument("--output", default="/home/jjg65/rds/hpc-work/ztf_nuts/nuts_samples_explicit.pt")
+    parser.add_argument("--output", default="/Users/joygong/CAMBRIDGE/snhost/scratch/nuts_samples_explicit.pt")
     parser.add_argument("--cuda", action="store_true", help="run on GPU")
 
     args = parser.parse_args()
@@ -264,4 +329,3 @@ if __name__ == '__main__':
 
 
     
-
