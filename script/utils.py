@@ -18,10 +18,14 @@ _DEFAULT_TRIPP_PT_DIR = Path(__file__).resolve().parent.parent / "scratch"
 
 MODEL_COLORS = {
     "Diffusion": "#882255",
-    "VE SDE OOS": "#66CCEE",
+    "VE SDE-4 OOS": "#66CCEE",
     "VE SDE 80": "#882255",
     # "VE SDE 100": "teal",
     "VE SDE 100": "#882255",
+    "VE SDE OOS": "#66CCEE",
+    "VE SDE-4 100": "#882255",
+    "VE SDE-2 100": "#C7ABFF",
+    "VE SDE-2 OOS": "#66CCEE",
     "VE SDE 100 2": "red",
     "VP SDE": "teal",
     "VP SDE ind": "teal",
@@ -29,8 +33,12 @@ MODEL_COLORS = {
     "Tripp+mass": "#117733",
     "Tripp+mass+ab": "#117733",
     "GP": "#DD8452",
+    "GP-4 100": "#DD8452",
+    # "GP-2 100": "#7D1313",
+    "GP-2 100": "#FFF075",
     "GP 100": "#DD8452",
-    "GP OOS": "#66CCEE",
+    "GP-4 OOS": "#66CCEE",
+    "GP-2 OOS": "#66CCEE",
 }
 
 TRIPP_LINESTYLES = {
@@ -497,6 +505,20 @@ def _residual_step_center(values, stat):
         return float(np.mean(values))
     raise ValueError(f"stat must be 'median' or 'mean' (got {stat!r})")
 
+def _residual_step_error(values, stat):
+    """
+    Standard error on the central statistic.
+    mean   -> std / sqrt(n)
+    median -> 1.2533 * std / sqrt(n)   (SE of the median under normality)
+    """
+    n = len(values)
+    if n < 2:
+        return float(np.nan)
+    sd = float(np.std(values, ddof=1))
+    sem = sd / np.sqrt(n)
+    if stat == "median":
+        return 1.2533 * sem
+    return sem
 
 def residual_step_bias(residual, x_host, thresh, stat="median"):
     """
@@ -520,11 +542,42 @@ def residual_step_bias(residual, x_host, thresh, stat="median"):
         residual[low], stat
     )
 
+# def residual_step_bias(residual, x_host, thresh, stat="median"):
+#     """
+#     Central residual with x_host >= thresh minus that with x_host < thresh.
 
-def median_residual_step_bias(residual, x_host, thresh):
-    """Deprecated name for ``residual_step_bias(..., stat=\"median\")``."""
-    return residual_step_bias(residual, x_host, thresh, stat="median")
+#     Returns:
+#         step_bias = stat(high) - stat(low)
+#         high_stat = stat(residual | high host)
+#         low_stat  = stat(residual | low host)
+#     """
+#     residual = _to_numpy(residual).reshape(-1)
+#     x_host = _to_numpy(x_host).reshape(-1)
 
+#     if len(residual) != len(x_host):
+#         raise ValueError(
+#             "residual and x_host must have the same length; "
+#             f"got {len(residual)} and {len(x_host)}."
+#         )
+
+#     low = x_host < thresh
+#     high = x_host >= thresh
+
+#     if not np.any(low) or not np.any(high):
+#         return {
+#             "step_bias": np.nan,
+#             "low_stat": np.nan,
+#             "high_stat": np.nan,
+#         }
+
+#     low_stat = _residual_step_center(residual[low], stat)
+#     high_stat = _residual_step_center(residual[high], stat)
+
+#     return {
+#         "step_bias": high_stat - low_stat,
+#         "low_stat": low_stat,
+#         "high_stat": high_stat,
+#     }
 
 def residual_host_step_bias_table(
     residuals,
@@ -572,12 +625,60 @@ def residual_host_step_bias_table(
                 ),
             }
         )
+
+    # rows = []
+
+    # for name, res in residuals.items():
+
+    #     mass = residual_step_bias(
+    #         res, log10M, thresh_mass, stat=stat
+    #     )
+
+    #     massab = residual_step_bias(
+    #         res, log10M, thresh_massab, stat=stat
+    #     )
+
+    #     ssfr = residual_step_bias(
+    #         res, log10sSFR, thresh_ssfr, stat=stat
+    #     )
+
+    # rows.append(
+    #     {
+    #         "model": name,
+
+    #         # mass step
+    #         "residual_mass_bias_mass_steppos":
+    #             mass["step_bias"],
+    #         "mass_low_host_stat":
+    #             mass["low_stat"],
+    #         "mass_high_host_stat":
+    #             mass["high_stat"],
+
+    #         # mass+ab step
+    #         "residual_mass_bias_massab_steppos":
+    #             massab["step_bias"],
+    #         "massab_low_host_stat":
+    #             massab["low_stat"],
+    #         "massab_high_host_stat":
+    #             massab["high_stat"],
+
+    #         # sSFR step
+    #         "residual_ssfr_bias_ssfr_steppos":
+    #             ssfr["step_bias"],
+    #         "ssfr_low_host_stat":
+    #             ssfr["low_stat"],
+    #         "ssfr_high_host_stat":
+    #             ssfr["high_stat"],
+    #     }
+    # )
+
     meta = {
         "stat": stat,
         "thresh_log10M_Tripp_mass": thresh_mass,
         "thresh_log10M_Tripp_massab": thresh_massab,
         "thresh_log10sSFR_Tripp_sSFR": thresh_ssfr,
     }
+
     return pd.DataFrame(rows), meta
 
 
@@ -1172,3 +1273,275 @@ def plot_qq_residuals(
         plt.close(fig)
 
     return fig, axes, resolved_colors, pairs
+
+
+##### CALCULATE ROLLING MEDIAN ######
+def rolling_stat(x, y, window=None, n_eval=200, min_count=15, stat='median',
+                  mode='width'):
+    """
+    Compute a sliding-window statistic of y vs x, evaluated at `n_eval`
+    points spanning the range of x.
+ 
+    mode='width'  : `window` is a fixed x-width (e.g. 0.3 dex in mass).
+                    Window membership = points with |x - x_eval| < window/2.
+                    Window size in x is constant; number of points per
+                    window varies with local data density.
+    mode='count'  : `window` is a fixed number of nearest neighbours in x
+                    (e.g. window=50). Number of points per window is
+                    constant; the x-width varies with local data density.
+                    This is the "unequal bin size in x" version, analogous
+                    to your binned_statistic but sliding instead of disjoint.
+ 
+    Points are masked out (np.nan) wherever fewer than `min_count` points
+    fall in the window, so the curve doesn't extend into sparse/empty
+    regions where the statistic is unreliable.
+ 
+    Returns: x_eval, center, err (SEM on the median/mean), n_used
+    """
+    x = _to_numpy(x).reshape(-1)
+    y = _to_numpy(y).reshape(-1)
+    order = np.argsort(x)
+    x, y = x[order], y[order]
+ 
+    x_eval = np.linspace(x.min(), x.max(), n_eval)
+    center = np.full(n_eval, np.nan)
+    err = np.full(n_eval, np.nan)
+    n_used = np.zeros(n_eval, dtype=int)
+ 
+    if mode == 'width':
+        half = window / 2.0
+        for i, xe in enumerate(x_eval):
+            mask = np.abs(x - xe) < half
+            n = mask.sum()
+            n_used[i] = n
+            if n < min_count:
+                continue
+            vals = y[mask]
+            center[i] = np.median(vals) if stat == 'median' else np.mean(vals)
+            sd = np.std(vals, ddof=1)
+            sem = sd / np.sqrt(n)
+            err[i] = 1.2533 * sem if stat == 'median' else sem
+ 
+    elif mode == 'count':
+        k = int(window)
+        # for each x_eval point, take the k nearest points in x (by index
+        # via searchsorted, then expand symmetrically)
+        idx_sorted = np.searchsorted(x, x_eval)
+        n = len(x)
+        for i, center_idx in enumerate(idx_sorted):
+            lo = max(0, center_idx - k // 2)
+            hi = min(n, lo + k)
+            lo = max(0, hi - k)  # re-clamp if hi hit the upper edge
+            vals = y[lo:hi]
+            n_used[i] = len(vals)
+            if len(vals) < min_count:
+                continue
+            center[i] = np.median(vals) if stat == 'median' else np.mean(vals)
+            sd = np.std(vals, ddof=1)
+            sem = sd / np.sqrt(len(vals))
+            err[i] = 1.2533 * sem if stat == 'median' else sem
+    else:
+        raise ValueError("mode must be 'width' or 'count'")
+ 
+    return x_eval, center, err, n_used
+
+##### PLOT ROLLING MEDIAN ######
+def plot_rolling_median(ax, residuals, xhost, models, colors, window,
+                         mode='width', n_eval=200, min_count=15, stat='median',
+                         scatter_model='Diffusion-4 100', band_alpha=0.25,
+                         scatter_alpha=0.15, thresh=None, bias_fn=None,
+                         model_labels=None, bias_stat='mean',
+                         step_label='', text_positions=None,
+                         text_fontsize=11):
+    """
+    Plot a rolling median (or mean) with a shaded SEM band for each model
+    in `models`, over a grey background scatter of one model's residuals.
+ 
+    If `thresh` is given (and `bias_fn` is your residual_step_bias-style
+    function), each model's legend label also states its two-sided
+    residual step bias at that threshold, e.g.
+        "gaussian process, Δ(mass) = +0.011 mag"
+    so the rolling-median shape and the headline step number both show
+    up together in one legend, without drawing the step itself.
+ 
+    model_labels : optional dict mapping entries of `models` to a nicer
+    display name (e.g. {'GP-4 100': 'gaussian process'}). Falls back to
+    the raw model key if not given.
+ 
+    text_positions : optional dict mapping entries of `models` to an
+    (x, y) tuple in axes-fraction coordinates. For any model present in
+    this dict, a floating text annotation (same style as the step plot's
+    in-panel text) is drawn at that position stating its Δ bias, e.g.
+        {'Tripp+sSFR': (0.4, 0.3), 'GP-4 100': (0.15, 0.6)}
+    Requires `thresh` and `bias_fn` to also be set, since the text needs
+    the computed bias value. Models not in this dict get no floating
+    text (legend label is still shown as usual).
+ 
+    step_label : optional string used in the floating text, e.g. 'mass'
+    or 'sSFR', to produce "Δ(mass) = +0.011 mag" instead of "Δ = ...".
+    """
+    ax.scatter(xhost, residuals[scatter_model], color='grey',
+               alpha=scatter_alpha, s=15, zorder=0)
+ 
+    delta_str = f"({step_label})" if step_label else ""
+ 
+    for model, color in zip(models, colors):
+        x_eval, center, err, n_used = rolling_stat(
+            xhost, residuals[model], window=window, n_eval=n_eval,
+            min_count=min_count, stat=stat, mode=mode,
+        )
+ 
+        display_name = (model_labels or {}).get(model, model)
+        label = display_name
+        bias = None
+        if thresh is not None and bias_fn is not None:
+            bias = bias_fn(residuals[model], xhost, thresh=thresh, stat=bias_stat)
+            label = f"{display_name}, Δ{delta_str} = {bias['bias']:+.3f} mag"
+ 
+        ax.plot(x_eval, center, color=color, lw=2, label=label, zorder=3)
+        ax.fill_between(x_eval, center - err, center + err,
+                         color=color, alpha=band_alpha, lw=0, zorder=2)
+ 
+        # optional floating in-panel text, same style as the step plot
+        if text_positions is not None and model in text_positions:
+            if bias is None:
+                raise ValueError(
+                    f"text_positions given for '{model}' but thresh/bias_fn "
+                    "were not provided, so no bias value is available to "
+                    "annotate."
+                )
+            tx, ty = text_positions[model]
+            ax.text(
+                tx, ty,
+                f"{display_name}\nΔ{delta_str} = {bias['bias']:+.3f} mag",
+                transform=ax.transAxes, fontsize=text_fontsize, color=color,
+            )
+ 
+    # thin dotted vertical guide at the threshold (visual anchor, not a fit)
+    if thresh is not None:
+        ax.axvline(thresh, color='lightgrey', lw=0.8, ls=':', zorder=1)
+
+    # thin dotted horizontal guide at hr = 0 
+    # ax.axhline(0, color='grey', lw=0.8, ls=':', zorder=2)
+
+    ax.set_ylabel(r'$\Delta \mu \; (\rm mag)$')
+    return ax
+
+
+###### OVERPLOT STEP #######
+def _draw_step(ax, bias, thresh, color, lw=2.5, ls='-', label=None,
+               alpha=1.0, errorbar_capsize=4, zorder=4,
+               error_style='errorbar', band_alpha=0.25):
+    """
+    Draw a two-level step: flat horizontal segment on each side of `thresh`
+    at the side's mean/median, with the SEM shown either as a point error
+    bar centered on each segment ('errorbar') or as a shaded band spanning
+    the full width of each segment ('band'), and a thin dotted vertical
+    guide at the threshold. No diagonal connector between the two levels.
+ 
+    error_style : 'errorbar', 'band', or 'both'
+    """
+    # horizontal segments (span the actual x-range of points on each side)
+    ax.hlines(bias['ylow'], bias['xmin_low'], bias['xmax_low'],
+              color=color, lw=lw, ls=ls, alpha=alpha, zorder=zorder,
+              label=label)
+    ax.hlines(bias['yhigh'], bias['xmin_high'], bias['xmax_high'],
+              color=color, lw=lw, ls=ls, alpha=alpha, zorder=zorder)
+ 
+    if error_style in ('errorbar', 'both'):
+        # vertical SEM error bars, centered on each segment (placed at
+        # xlow/xhigh, the central x value of each side)
+        ax.errorbar(bias['xlow'], bias['ylow'], yerr=bias['yerr_low'],
+                     fmt='none', ecolor=color, elinewidth=lw * 0.7,
+                     capsize=errorbar_capsize, alpha=alpha, zorder=zorder)
+        ax.errorbar(bias['xhigh'], bias['yhigh'], yerr=bias['yerr_high'],
+                     fmt='none', ecolor=color, elinewidth=lw * 0.7,
+                     capsize=errorbar_capsize, alpha=alpha, zorder=zorder)
+ 
+    if error_style in ('band', 'both'):
+        # shaded SEM band spanning the full x-range of each segment
+        ax.fill_between([bias['xmin_low'], bias['xmax_low']],
+                         bias['ylow'] - bias['yerr_low'],
+                         bias['ylow'] + bias['yerr_low'],
+                         color=color, alpha=band_alpha, lw=0, zorder=zorder - 1)
+        ax.fill_between([bias['xmin_high'], bias['xmax_high']],
+                         bias['yhigh'] - bias['yerr_high'],
+                         bias['yhigh'] + bias['yerr_high'],
+                         color=color, alpha=band_alpha, lw=0, zorder=zorder - 1)
+ 
+    # thin dotted vertical guide at the threshold (visual anchor, not a fit)
+    ax.axvline(thresh, color='lightgrey', lw=0.8, ls=':', zorder=1)
+
+    # thin dotted horizontal guide at hr = 0 
+    ax.axhline(0, color='lightgrey', lw=0.8, ls=':', zorder=2)
+
+def plot_resid_bias(ax, residuals, xhost, xname, masstype, model, error_style='band', band_alpha=0.25, 
+                            t_x=0.05, t_y=0.3, m_x=0.05, m_y=0.15):
+    if xname == 'mass':
+        tripp_model = 'Tripp+sSFR'
+        if masstype == 1: 
+            thresh = Tripp_mass_params_steppos
+        else: 
+            thresh = Tripp_massab_params_steppos
+        title_text = "corrected for sSFR → bias leaks into mass"
+        step_label = "mass"
+    else:
+        tripp_model = 'Tripp+mass'
+        thresh = Tripp_sSFR_params_steppos
+        title_text = "corrected for mass → bias leaks into sSFR"
+        step_label = "sSFR"
+ 
+    # NOTE: this must call `residual_step_bias` (no leading underscore).
+    # If your notebook also has an older `_residual_step_bias` floating
+    # around, calling that instead silently gives a dict without
+    # 'yerr_low'/'yerr_high'/'n_low' etc., so the error bars won't draw.
+    tripp_bias = _residual_step_bias(residuals[tripp_model], xhost, thresh=thresh, stat='mean')
+    gp_bias = _residual_step_bias(residuals['GP-4 100'], xhost, thresh=thresh, stat='mean')
+    diffusion_bias = _residual_step_bias(residuals['Diffusion-4 100'], xhost, thresh=thresh, stat='mean')
+ 
+    # background scatter (Tripp residuals, for context)
+    ax.scatter(xhost, residuals[tripp_model], s=20, color='grey', alpha=0.1, zorder=0)
+ 
+    # Tripp step (grey, dashed)
+    _draw_step(ax, tripp_bias, thresh, color='grey', lw=2, ls='--',
+               label=f'Tripp residual step, {xname}', error_style=error_style, band_alpha=band_alpha)
+ 
+    # Model step (GP or diffusion, solid, colored)
+    if model == 'gp':
+        mname, mcolor, mbias = 'gaussian process', '#DD8452', gp_bias
+    else:
+        mname, mcolor, mbias = 'diffusion', '#882255', diffusion_bias
+    _draw_step(ax, mbias, thresh, color=mcolor, lw=2.5, ls='-', error_style=error_style, band_alpha=band_alpha)
+ 
+    ## text
+    ax.text(0.0, 1.05, title_text, transform=ax.transAxes, fontsize=11)
+ 
+    # ax.text(
+    #     0.4, 0.3,
+    #     f"single-parameter step\n"
+    #     f"Δ({step_label}) = {tripp_bias['bias']:+.3f} mag",
+    #     transform=ax.transAxes, fontsize=11, color='#363535',
+    # )
+    # ax.text(
+    #     0.15, 0.6,
+    #     f"{mname}\nΔ({step_label}) = {mbias['bias']:+.3f} mag",
+    #     transform=ax.transAxes, fontsize=11, color=mcolor,
+    # )
+ 
+    ax.text(
+        t_x, t_y,
+        f"single-parameter step\n"
+        f"Δ({step_label}) = {tripp_bias['bias']:+.3f} mag",
+        transform=ax.transAxes, fontsize=11, color='#363535',
+    )
+    ax.text(
+        m_x, m_y,
+        f"{mname}\nΔ({step_label}) = {mbias['bias']:+.3f} mag",
+        transform=ax.transAxes, fontsize=11, color=mcolor,
+    )
+
+    if xname == 'mass':
+        ax.set_xlabel(r'host stellar mass $\log_{10}(M/M_\odot)$')
+    else:
+        ax.set_xlabel(r'host sSFR $\log_{10}(\mathrm{sSFR}/\mathrm{yr}^{-1})$')
+    ax.set_ylabel(r'$\Delta \mu \; (\rm mag)$')

@@ -55,6 +55,19 @@ def load_hierarchical_gp_data(
         dtype=dtype,
         device=device,
     ))
+    data.update(load_npz(
+        ztf_dir / "mu_param.npz",
+        ["mu_cat"],
+        dtype=dtype,
+        device=device,
+    ))
+
+    data.update(load_npz(
+        ztf_dir / "gp_param.npz",
+        ["y_std", "y_noise_e"],
+        dtype=dtype,
+        device=device,
+    ))
 
     for name in [
         "log10M_remain_med",
@@ -70,6 +83,18 @@ def load_hierarchical_gp_data(
         data["log10sSFR_med"],
         data["mcmc_dust2_med"],
     ])
+
+    # load thinned chains: already in pt format  
+    chains = torch.load(gal_dir / "thin_chains_patched.pt",
+                        map_location="cpu", weights_only=True)
+    for name in [
+        "log10M_remain",
+        "mcmc_metal",
+        "log10sSFR",
+        "mcmc_dust2",
+    ]:
+        data[f"{name}_thin"] = chains[name].to(dtype=dtype, device=device)
+    
     data["yhat"] = torch.cat([
         data["mB_cat"],
         data["x1_cat"],

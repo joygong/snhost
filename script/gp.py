@@ -21,8 +21,37 @@ dtype = torch.float32
 #         cov_pred: predictive (co)variance; shape (m, m)
 #         p: log marginal likelihood; shape (1, 1)
 #     """
+def safe_cholesky(K, jitter=1e-8, max_tries=5, upper=False):
+    """Iteratively add jitter until K can safely be Cholesky decomposed.
+    Inputs: 
+        K: covariance matrix 
+        jitter: starting jitter; default 1e-8
+        max_tries: maximum attempts to scale jitter by
+        upper: L upper or lower triangular; default False 
+    Outputs: 
+        L: Cholesky decomposition, lower triangular 
+    """
+    # K = 0.5 * (K + K.T)
+    I = torch.eye(K.shape[0], device=K.device, dtype=K.dtype)
 
-def predict(kernel, X_train, y_train, X_test, params, y_train_noise=None, jitter=1e-13):
+    for i in range(max_tries):
+        jitter_i = jitter * (10 ** i)
+        print('jitter:', jitter_i)
+        try:
+            return torch.linalg.cholesky(K + jitter_i * I, upper=upper)    # L
+        except torch.linalg.LinAlgError:
+            pass
+
+    # Check jitter / kernel variance ratio to ensure jitter << variance 
+    print('jitter / variance:', jitter_i / K.diag().median())     # denom should = sigma_f**2
+
+    evals = torch.linalg.eigvalsh(K)
+    raise RuntimeError(
+        f"Cholesky failed. min eigenvalue={evals.min().item():.3e}, "
+        f"jitter tried up to {jitter_i:.3e}"
+    )
+
+def predict(kernel, X_train, y_train, X_test, params, y_train_noise=None, jitter=1e-13, max_tries=4):
     """
     Calculate predictive mean and variance. 
     Inputs: 
@@ -56,7 +85,8 @@ def predict(kernel, X_train, y_train, X_test, params, y_train_noise=None, jitter
     Kss = kernel(X_test, X_test, params)                            # doesn't need jitter, b/c no decomposition 
 
     # Cholesky
-    L = torch.linalg.cholesky(K, upper=False)                       # (n, n), lower triangular
+    L = safe_cholesky(K, jitter=jitter, max_tries=max_tries, upper=False)
+    # L = torch.linalg.cholesky(K, upper=False)                       # (n, n), lower triangular
 
     # Solve for alpha
     b = torch.linalg.solve_triangular(L, y_train, upper=False)      # (n, 1), L = lower triangular; only lower part is accessed
@@ -134,6 +164,7 @@ def optimize_GP(raw_params, kernel, X_train, base_params, epochs=2000):
         
         # Cholesky
         L = torch.linalg.cholesky(Ky, upper=False)                       # (n, n), lower triangular
+        # maybe change to K = safe_cholesky(...)
 
         # Solve for alpha
         b = torch.linalg.solve_triangular(L, y, upper=False)            # (n, 1), L = lower triangular; only lower part is accessed

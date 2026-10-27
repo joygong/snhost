@@ -20,4 +20,18 @@ def sq_exp(X1, X2, params):
     # if using noisy data, add sigma_n^2 + I
     return K
 
+def sq_exp_batch(X1, X2, params):
+    """Batched squared-exponential kernel. Same as sq_exp with a leading realization axis.
+    Inputs:
+        X1: (K, n, D)
+        X2: (K, m, D)
+        params:
+            - sigma_f: overall amplitude, one per realization; shape (K,)
+            - ell: lengthscales, one set per realization; shape (K, D)
+    Outputs:
+        K: (K, n, m)
+    """
+    d = (X1[:, :, None, :] - X2[:, None, :, :]) / params["ell"][:, None, None, :]
+    return (params["sigma_f"] ** 2)[:, None, None] * torch.exp(-0.5 * (d ** 2).sum(-1))
+
 
