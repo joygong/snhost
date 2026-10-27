@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH -t 12:00:00
-#SBATCH --job-name=gp_dist
-#SBATCH --account=YOURPROJECT-SL2-GPU
+#SBATCH -t 18:00:00
+#SBATCH --job-name=GP_DIST
+#SBATCH --account=PEIRIS-SL2-GPU
 #SBATCH --partition=ampere
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
-#SBATCH --output=/home/jjg65/rds/hpc-work/logs/gp_dist_%j.out
+#SBATCH --output=/home/jjg65/slurm_outputs/%x_%j.out
 #SBATCH --mail-type=BEGIN,END
 #SBATCH --mail-user=jjg65@cam.ac.uk
 
@@ -22,9 +22,13 @@
 
 # load anything necessary
 # your .bashrc should get run anyway
+set -e          # stop at the first failure instead of limping on
+
 module purge
 module load cuda/11.8
 module load anaconda
+
+source $(conda info --base)/etc/profile.d/conda.sh
 conda activate myenv
 
 # run script
