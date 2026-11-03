@@ -8,23 +8,27 @@ import matplotlib.pyplot as plt
 from flowfusion.diffusion import VESDE, VPSDE, MLP, ScoreModel, denoising_score_matching
 
 
-def __init__(X, sde, n_cond): 
-    """ 
-    Initialize score model. 
-    
-    Parameters: 
+def __init__(X, sde, n_cond, device=None):
+    """
+    Initialize score model.
+
+    Parameters:
         X: concatenated tensor of conditionals and target; (633, 7)
         sde: VESDE() or VPSDE()
+        device: optional device to place the score network on (e.g. 'cuda')
 
     Returns:
         score_model: untrained score model
         n_cond: conditional dimensions
-        n_dims: target dimensions  
+        n_dims: target dimensions
     """
     n_dims = X.shape[1] - n_cond
 
-    score_network = MLP(n_dimensions=n_dims, n_conditionals=n_cond, units=[128, 128, 128])     
-    score_model = ScoreModel(model=score_network, sde=sde) 
+    score_network = MLP(n_dimensions=n_dims, n_conditionals=n_cond, units=[128, 128, 128])
+    score_model = ScoreModel(model=score_network, sde=sde)
+
+    if device is not None:
+        score_model.model.to(device)
 
     return score_model, n_cond, n_dims
 
@@ -55,31 +59,37 @@ def train(score_model, X_train, n_cond, ratio_t, ratio_v, optimize_M0=True, M_0=
     g = torch.Generator().manual_seed(42)
 
     print('training...')
+    M0 = torch.nn.Parameter(M_0)    
+                                                                   # adaptive and isn't re-initialized for every lr
     for bs, lr in zip ([32, 64, 128, 256], [1e-03, 1e-04, 1e-05, 1e-06]):       # bs and lr linked 
         print('batch size:', bs)
         print('learning rate:', lr)
         
-        M0 = torch.nn.Parameter(M_0)
+        # M0 = torch.nn.Parameter(M_0)
         
         if optimize_M0: 
             optimizer = Adam(list(score_model.model.parameters()) + [M0], lr=lr)
         else: 
             optimizer = Adam(score_model.model.parameters(), lr=lr)
         
-        n_train, n_test = random_split(X_train, (ratio_t, ratio_v), generator=g)
+        if ratio_v > 0:
+            n_train, n_test = random_split(X_train, (ratio_t, ratio_v), generator=g)
+        else:
+            n_train, n_test = X_train, None     # train on everything, no validation split
 
         data_loader = DataLoader(n_train, shuffle=True, batch_size=bs)
         for _ in trange(epochs):
-            c = 0                           # mini-batch 
+            c = 0                           # mini-batch
             for n in data_loader:           # loop over each mini batch in training data
-                optimizer.zero_grad()   
+                optimizer.zero_grad()
                 loss = denoising_score_matching(score_model, n[:,n_cond:] + M0, conditional=n[:,:n_cond])    # add only to the targets, not conditionals, s.t. y = mu - (mB - M0)
                 loss.backward()
                 optimizer.step()
-                losses.append(loss.detach().numpy())
+                losses.append(loss.detach().cpu().numpy())
                 c += 1
-            test_loss = denoising_score_matching(score_model, n_test.dataset[n_test.indices][:,n_cond:] + M0, conditional=n_test.dataset[n_test.indices][:, :n_cond])
-            test_losses.append(test_loss.detach().numpy())
+            if n_test is not None:
+                test_loss = denoising_score_matching(score_model, n_test.dataset[n_test.indices][:,n_cond:] + M0, conditional=n_test.dataset[n_test.indices][:, :n_cond])
+                test_losses.append(test_loss.detach().cpu().numpy())
             steps_per_epoch.append(c)
         print('bs:', bs)
         print('lr:', lr)
@@ -87,9 +97,10 @@ def train(score_model, X_train, n_cond, ratio_t, ratio_v, optimize_M0=True, M_0=
 
     print('done')
  
-    if plot: 
+    if plot:
         plt.plot(1+np.arange(len(losses)), losses, color='k', linewidth=0.2, label='training loss')             # 4*epochs
-        plt.plot(np.cumsum(steps_per_epoch), test_losses, color='r', linewidth=1.0, label='validation loss')    # (ceil(len(n_train) / 32) + ceil(len(n_train) / 64 + ... etc.) * epochs = 30*epochs
+        if test_losses:
+            plt.plot(np.cumsum(steps_per_epoch), test_losses, color='r', linewidth=1.0, label='validation loss')    # (ceil(len(n_train) / 32) + ceil(len(n_train) / 64 + ... etc.) * epochs = 30*epochs
         plt.xlabel('step')
         plt.ylabel('score-matching loss')
         plt.legend(frameon=False)
